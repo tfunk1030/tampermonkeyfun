@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         SimpCity Post & Thread Filter
 // @namespace    https://github.com/taylorfunk/simpcity-tools
-// @version      2.1.0
-// @description  Sort threads and posts by most liked/reactions with date filtering. Forum lists use native XenForo sorting. Thread view highlights and ranks posts with jump-to links (no DOM reordering = no broken handlers). Touch/mobile support, boundary-clamped panel.
+// @version      2.2.0
+// @description  Sort threads and posts by most liked/reactions with date filtering. Scan All Pages to rank posts across entire threads. Forum lists sort by Likes, Views, or Replies. Touch/mobile support, boundary-clamped panel.
 // @author       Taylor Funk
 // @license      MIT
 // @match        https://simpcity.cr/*
@@ -120,6 +120,30 @@
 
     article.message.${SCRIPT_ID}-hidden { display: none !important; }
 
+    .${SCRIPT_ID}-scan-btn {
+      flex: 1; background: linear-gradient(135deg, #3b82f6 0%, #2563eb 100%); border: none; border-radius: 8px;
+      padding: 9px; color: white; font-size: 12px; font-weight: 700; cursor: pointer; transition: filter 0.15s;
+    }
+    .${SCRIPT_ID}-scan-btn:hover { filter: brightness(1.1); }
+    .${SCRIPT_ID}-scan-btn:disabled { opacity: 0.5; cursor: not-allowed; filter: none; }
+
+    .${SCRIPT_ID}-progress { margin-top: 4px; }
+    .${SCRIPT_ID}-progress-bar {
+      height: 4px; background: #1c1c1c; border-radius: 4px; overflow: hidden; margin-bottom: 4px;
+    }
+    .${SCRIPT_ID}-progress-fill {
+      height: 100%; background: linear-gradient(90deg, #3b82f6, #3aff9d); border-radius: 4px;
+      transition: width 0.3s ease; width: 0%;
+    }
+    .${SCRIPT_ID}-progress-text { font-size: 10px; color: #666; text-align: center; }
+
+    .${SCRIPT_ID}-scroll-page {
+      font-size: 9px; color: #555; background: rgba(255,255,255,0.05); padding: 1px 5px;
+      border-radius: 4px; white-space: nowrap; flex-shrink: 0;
+    }
+    .${SCRIPT_ID}-scroll-item.cross-page { border-left: 2px solid #3b82f6; padding-left: 6px; }
+    .${SCRIPT_ID}-scroll-item.cross-page .${SCRIPT_ID}-scroll-rank { color: #60a5fa; }
+
     .${SCRIPT_ID}-forum-bar {
       display: flex; gap: 6px; align-items: center; padding: 8px 12px; flex-wrap: wrap;
       background: rgba(18, 18, 18, 0.95); border: 1px solid #2b2b2b; border-radius: 10px; margin-bottom: 12px;
@@ -137,6 +161,10 @@
   // Active highlight timer - prevents stacking when clicking scroll items rapidly
   let _highlightTimer = null;
   let _highlightedEl = null;
+
+  // Cross-page scan state
+  let _scanCache = null; // { url, posts[] } - cached scan results
+  let _isScanning = false;
 
   function getDateCutoff(rangeKey) {
     const range = DATE_RANGES[rangeKey];
@@ -206,6 +234,94 @@
   }
 
   // ========================================
+  // CROSS-PAGE SCANNING
+  // ========================================
+  function getThreadPageCount() {
+    const pageNavItems = document.querySelectorAll('.pageNav-page a, .pageNav-page');
+    let maxPage = 1;
+    pageNavItems.forEach(el => {
+      const num = parseInt(el.textContent.trim(), 10);
+      if (!isNaN(num) && num > maxPage) maxPage = num;
+    });
+    return maxPage;
+  }
+
+  function getThreadBaseUrl() {
+    // Strip /page-N and query params to get the base thread URL
+    let url = window.location.pathname.replace(/\/page-\d+$/, '');
+    if (!url.endsWith('/')) url += '/';
+    return window.location.origin + url;
+  }
+
+  function extractPostsFromDoc(doc, pageNum, pageUrl) {
+    const posts = doc.querySelectorAll('article.message, .message[data-content]');
+    return Array.from(posts).map(postEl => {
+      const reactions = getReactionCount(postEl);
+      let postDate = null;
+      const timeEl = postEl.querySelector('time[datetime], .message-attribution time, .message-date time, header time');
+      if (timeEl) {
+        const dt = timeEl.getAttribute('datetime');
+        if (dt) postDate = new Date(dt);
+      }
+      const postId = postEl.id || postEl.dataset.content || '';
+      const author = (postEl.querySelector('.message-name, .username') || {}).textContent?.trim() || '';
+      return { reactions, postDate, postId, author, pageNum, pageUrl, isCurrentPage: false };
+    });
+  }
+
+  async function fetchPage(url) {
+    const response = await fetch(url, { credentials: 'same-origin' });
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    const html = await response.text();
+    return new DOMParser().parseFromString(html, 'text/html');
+  }
+
+  async function scanAllPages(onProgress) {
+    const totalPages = getThreadPageCount();
+    const baseUrl = getThreadBaseUrl();
+    const allPosts = [];
+
+    // Current page posts (from DOM — these we can scroll to)
+    const currentPagePosts = getAllPosts().map(el => {
+      const pd = getPostData(el);
+      const currentPath = window.location.pathname;
+      const pageMatch = currentPath.match(/\/page-(\d+)/);
+      const currentPageNum = pageMatch ? parseInt(pageMatch[1], 10) : 1;
+      return { ...pd, pageNum: currentPageNum, pageUrl: window.location.href, isCurrentPage: true };
+    });
+    allPosts.push(...currentPagePosts);
+    onProgress(1, totalPages);
+
+    if (totalPages <= 1) return allPosts;
+
+    // Determine which page number is the current page
+    const currentPath = window.location.pathname;
+    const currentPageMatch = currentPath.match(/\/page-(\d+)/);
+    const currentPageNum = currentPageMatch ? parseInt(currentPageMatch[1], 10) : 1;
+
+    // Fetch all other pages (sequential with small delay to be polite)
+    for (let page = 1; page <= totalPages; page++) {
+      if (page === currentPageNum) continue; // Already have current page
+
+      const pageUrl = page === 1 ? baseUrl : baseUrl + 'page-' + page;
+      try {
+        const doc = await fetchPage(pageUrl);
+        const posts = extractPostsFromDoc(doc, page, pageUrl);
+        allPosts.push(...posts);
+      } catch (err) {
+        log(`Failed to fetch page ${page}:`, err.message);
+      }
+
+      onProgress(page <= currentPageNum ? page : page, totalPages);
+
+      // Small delay between requests to avoid hammering the server
+      if (page < totalPages) await new Promise(r => setTimeout(r, 300));
+    }
+
+    return allPosts;
+  }
+
+  // ========================================
   // THREAD VIEW: RANK + HIGHLIGHT
   // ========================================
   function getAllPosts() {
@@ -269,14 +385,15 @@
     log('Filters reset');
   }
 
-  function buildScrollList(sorted) {
+  function buildScrollList(sorted, maxItems = 20) {
     const container = document.getElementById(`${SCRIPT_ID}-scroll-list`);
     if (!container) return;
     container.innerHTML = '';
     const fragment = document.createDocumentFragment();
-    sorted.slice(0, 20).forEach((pd, rank) => {
+    sorted.slice(0, maxItems).forEach((pd, rank) => {
       const item = document.createElement('div');
-      item.className = `${SCRIPT_ID}-scroll-item`;
+      const isCrossPage = pd.pageNum !== undefined && !pd.isCurrentPage;
+      item.className = `${SCRIPT_ID}-scroll-item${isCrossPage ? ' cross-page' : ''}`;
       const rankEl = document.createElement('span');
       rankEl.className = `${SCRIPT_ID}-scroll-rank`;
       rankEl.textContent = `#${rank + 1}`;
@@ -289,16 +406,38 @@
       item.appendChild(rankEl);
       item.appendChild(info);
       item.appendChild(count);
-      item.onclick = () => {
-        // Clear previous highlight before applying new one
-        if (_highlightTimer) { clearTimeout(_highlightTimer); }
-        if (_highlightedEl) { _highlightedEl.style.outline = ''; _highlightedEl.style.outlineOffset = ''; }
-        pd.el.scrollIntoView({ behavior: 'smooth', block: 'center' });
-        pd.el.style.outline = '2px solid #3aff9d';
-        pd.el.style.outlineOffset = '4px';
-        _highlightedEl = pd.el;
-        _highlightTimer = setTimeout(() => { pd.el.style.outline = ''; pd.el.style.outlineOffset = ''; _highlightedEl = null; _highlightTimer = null; }, 2500);
-      };
+
+      // Show page number for cross-page results
+      if (pd.pageNum !== undefined) {
+        const pageTag = document.createElement('span');
+        pageTag.className = `${SCRIPT_ID}-scroll-page`;
+        pageTag.textContent = `p${pd.pageNum}`;
+        item.appendChild(pageTag);
+      }
+
+      if (pd.el && pd.isCurrentPage !== false) {
+        // Current page post — scroll to it
+        item.onclick = () => {
+          if (_highlightTimer) { clearTimeout(_highlightTimer); }
+          if (_highlightedEl) { _highlightedEl.style.outline = ''; _highlightedEl.style.outlineOffset = ''; }
+          pd.el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+          pd.el.style.outline = '2px solid #3aff9d';
+          pd.el.style.outlineOffset = '4px';
+          _highlightedEl = pd.el;
+          _highlightTimer = setTimeout(() => { pd.el.style.outline = ''; pd.el.style.outlineOffset = ''; _highlightedEl = null; _highlightTimer = null; }, 2500);
+        };
+      } else if (pd.pageUrl && pd.postId) {
+        // Cross-page post — navigate to it
+        item.onclick = () => {
+          const anchor = pd.postId.startsWith('post-') ? pd.postId : 'post-' + pd.postId;
+          window.location.href = pd.pageUrl + '#' + anchor;
+        };
+        item.title = `Page ${pd.pageNum} — click to navigate`;
+      } else if (pd.pageUrl) {
+        item.onclick = () => { window.location.href = pd.pageUrl; };
+        item.title = `Page ${pd.pageNum}`;
+      }
+
       fragment.appendChild(item);
     });
     container.appendChild(fragment);
@@ -319,39 +458,147 @@
 
     const bar = document.createElement('div');
     bar.className = `${SCRIPT_ID}-forum-bar`;
-    const label = document.createElement('span');
-    label.className = `${SCRIPT_ID}-forum-bar-label`;
-    label.textContent = '🔥 Sort by Likes:';
-    bar.appendChild(label);
 
     const baseUrl = window.location.pathname;
     const currentParams = new URLSearchParams(window.location.search);
-    const isCurrentOrder = currentParams.get('order') === 'reaction_score';
+    const currentOrder = currentParams.get('order') || '';
 
-    Object.entries(DATE_RANGES).forEach(([key, range]) => {
+    // Sort mode selector
+    const FORUM_SORT_MODES = [
+      { key: 'reaction_score', label: '🔥 Most Liked', icon: '🔥' },
+      { key: 'view_count',     label: '👁 Most Viewed', icon: '👁' },
+      { key: 'reply_count',    label: '💬 Most Replies', icon: '💬' }
+    ];
+
+    const modeLabel = document.createElement('span');
+    modeLabel.className = `${SCRIPT_ID}-forum-bar-label`;
+    modeLabel.textContent = 'Sort:';
+    bar.appendChild(modeLabel);
+
+    FORUM_SORT_MODES.forEach(mode => {
       const pill = document.createElement('span');
       pill.className = `${SCRIPT_ID}-pill`;
-      pill.textContent = range.label;
-      if (key === 'all' && isCurrentOrder && !currentParams.has('last_days')) pill.classList.add('active');
-      else if (isCurrentOrder && currentParams.get('last_days') === String(range.days) && range.days > 0) pill.classList.add('active');
+      pill.textContent = mode.label;
+      if (currentOrder === mode.key) pill.classList.add('active');
       pill.addEventListener('click', () => {
         const p = new URLSearchParams();
-        p.set('order', 'reaction_score');
-        if (range.days > 0) p.set('last_days', String(range.days));
+        p.set('order', mode.key);
+        p.set('direction', 'desc');
         window.location.href = baseUrl + '?' + p.toString();
       });
       bar.appendChild(pill);
     });
 
+    // Separator + date range pills (only for reaction_score mode)
+    if (currentOrder === 'reaction_score') {
+      const sep = document.createElement('span');
+      sep.style.cssText = 'width: 1px; height: 18px; background: #333; margin: 0 4px;';
+      bar.appendChild(sep);
+
+      const dateLabel = document.createElement('span');
+      dateLabel.className = `${SCRIPT_ID}-forum-bar-label`;
+      dateLabel.textContent = 'Period:';
+      bar.appendChild(dateLabel);
+
+      Object.entries(DATE_RANGES).forEach(([key, range]) => {
+        const pill = document.createElement('span');
+        pill.className = `${SCRIPT_ID}-pill`;
+        pill.textContent = range.label;
+        if (key === 'all' && !currentParams.has('last_days')) pill.classList.add('active');
+        else if (currentParams.get('last_days') === String(range.days) && range.days > 0) pill.classList.add('active');
+        pill.addEventListener('click', () => {
+          const p = new URLSearchParams();
+          p.set('order', 'reaction_score');
+          if (range.days > 0) p.set('last_days', String(range.days));
+          window.location.href = baseUrl + '?' + p.toString();
+        });
+        bar.appendChild(pill);
+      });
+    }
+
     const resetPill = document.createElement('span');
     resetPill.className = `${SCRIPT_ID}-pill`;
     resetPill.textContent = '↩ Default';
     resetPill.style.color = '#888';
-    if (!isCurrentOrder) resetPill.classList.add('active');
+    if (!currentOrder) resetPill.classList.add('active');
     resetPill.addEventListener('click', () => { window.location.href = baseUrl; });
     bar.appendChild(resetPill);
 
     listContainer.parentElement.insertBefore(bar, listContainer);
+  }
+
+  // ========================================
+  // SCAN ALL PAGES
+  // ========================================
+  async function startScan() {
+    if (_isScanning) return;
+    _isScanning = true;
+
+    const scanBtn = document.getElementById(`${SCRIPT_ID}-scan-btn`);
+    const progressEl = document.getElementById(`${SCRIPT_ID}-progress`);
+    const progressFill = document.getElementById(`${SCRIPT_ID}-progress-fill`);
+    const progressText = document.getElementById(`${SCRIPT_ID}-progress-text`);
+
+    if (scanBtn) { scanBtn.disabled = true; scanBtn.textContent = 'Scanning...'; }
+    if (progressEl) progressEl.style.display = 'block';
+
+    try {
+      const allPosts = await scanAllPages((done, total) => {
+        const pct = Math.round((done / total) * 100);
+        if (progressFill) progressFill.style.width = pct + '%';
+        if (progressText) progressText.textContent = `Fetching page ${done} of ${total}...`;
+      });
+
+      // Cache the scan results
+      _scanCache = { url: getThreadBaseUrl(), posts: allPosts };
+
+      // Apply current filters to scanned data
+      const cutoff = getDateCutoff(currentDateRange);
+      let visible = allPosts;
+      if (cutoff) {
+        visible = allPosts.filter(pd => !pd.postDate || pd.postDate >= cutoff);
+      }
+
+      // Sort
+      const sorted = [...visible];
+      if (currentSort === 'reactions') sorted.sort((a, b) => b.reactions - a.reactions);
+      else if (currentSort === 'newest') sorted.sort((a, b) => (b.postDate || 0) - (a.postDate || 0));
+      else if (currentSort === 'oldest') sorted.sort((a, b) => (a.postDate || 0) - (b.postDate || 0));
+
+      // Also apply badges to current-page posts
+      const currentPagePosts = getAllPosts();
+      currentPagePosts.forEach(p => p.querySelectorAll(`.${SCRIPT_ID}-rank-badge`).forEach(b => b.remove()));
+
+      sorted.forEach((pd, rank) => {
+        if (pd.isCurrentPage && pd.el) {
+          const badge = document.createElement('span');
+          const isTop3 = rank < 3 && pd.reactions > 0;
+          badge.className = `${SCRIPT_ID}-rank-badge${isTop3 ? ' top3' : (pd.reactions === 0 ? ' zero' : '')}`;
+          badge.textContent = `#${rank + 1}/${allPosts.length} · ❤️ ${pd.reactions}`;
+          const header = pd.el.querySelector('.message-attribution, .message-userDetails, .message-cell--user, header');
+          if (header) header.appendChild(badge);
+        }
+      });
+
+      // Show top 50 in scroll list for scanned results
+      buildScrollList(sorted, 50);
+      isActive = true;
+      const hiddenCount = allPosts.length - visible.length;
+      updateStats(visible.length, hiddenCount, allPosts.length);
+
+      if (progressText) progressText.textContent = `Scanned ${getThreadPageCount()} pages — ${allPosts.length} total posts found`;
+      log(`Scan complete: ${allPosts.length} posts across ${getThreadPageCount()} pages`);
+    } catch (err) {
+      log('Scan failed:', err);
+      if (progressText) progressText.textContent = 'Scan failed — ' + err.message;
+    }
+
+    _isScanning = false;
+    if (scanBtn) {
+      scanBtn.disabled = false;
+      const pageCount = getThreadPageCount();
+      scanBtn.textContent = _scanCache ? `Re-scan (${pageCount} pages)` : `Scan All ${pageCount} Pages`;
+    }
   }
 
   // ========================================
@@ -460,6 +707,36 @@
     actions.appendChild(applyBtn);
     actions.appendChild(resetBtn);
     body.appendChild(actions);
+
+    // Scan All Pages button
+    const scanRow = document.createElement('div');
+    scanRow.className = `${SCRIPT_ID}-actions`;
+    const scanBtn = document.createElement('button');
+    scanBtn.className = `${SCRIPT_ID}-scan-btn`;
+    scanBtn.id = `${SCRIPT_ID}-scan-btn`;
+    const pageCount = getThreadPageCount();
+    scanBtn.textContent = pageCount > 1 ? `Scan All ${pageCount} Pages` : 'Scan Thread (1 page)';
+    scanBtn.onclick = startScan;
+    scanRow.appendChild(scanBtn);
+    body.appendChild(scanRow);
+
+    // Progress indicator (hidden by default)
+    const progress = document.createElement('div');
+    progress.className = `${SCRIPT_ID}-progress`;
+    progress.id = `${SCRIPT_ID}-progress`;
+    progress.style.display = 'none';
+    const progressBar = document.createElement('div');
+    progressBar.className = `${SCRIPT_ID}-progress-bar`;
+    const progressFill = document.createElement('div');
+    progressFill.className = `${SCRIPT_ID}-progress-fill`;
+    progressFill.id = `${SCRIPT_ID}-progress-fill`;
+    progressBar.appendChild(progressFill);
+    progress.appendChild(progressBar);
+    const progressText = document.createElement('div');
+    progressText.className = `${SCRIPT_ID}-progress-text`;
+    progressText.id = `${SCRIPT_ID}-progress-text`;
+    progress.appendChild(progressText);
+    body.appendChild(progress);
 
     // Scroll list
     const scrollList = document.createElement('div');
