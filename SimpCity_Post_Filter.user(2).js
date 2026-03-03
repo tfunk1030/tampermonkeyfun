@@ -31,9 +31,9 @@
   };
 
   const SORT_MODES = {
-    reactions: { label: '🔥 Most Liked',   key: 'reactions' },
-    newest:    { label: '🕐 Newest First',  key: 'newest' },
-    oldest:    { label: '📅 Oldest First',  key: 'oldest' }
+    reactions: { label: '🔥 Most Liked' },
+    newest:    { label: '🕐 Newest First' },
+    oldest:    { label: '📅 Oldest First' }
   };
 
   let currentDateRange = GM_getValue(`${SCRIPT_ID}_dateRange`, 'all');
@@ -155,8 +155,10 @@
   // UTILITIES
   // ========================================
   function log(...args) { console.log(LOG_PREFIX, ...args); }
-  function isThreadPage() { return !!document.querySelector('article.message, .message[data-content]'); }
-  function isForumListPage() { return !!document.querySelector('.structItem--thread') && !isThreadPage(); }
+  const _isThread = !!document.querySelector('article.message, .message[data-content]');
+  const _isForumList = !!document.querySelector('.structItem--thread') && !_isThread;
+  function isThreadPage() { return _isThread; }
+  function isForumListPage() { return _isForumList; }
 
   // Active highlight timer - prevents stacking when clicking scroll items rapidly
   let _highlightTimer = null;
@@ -293,16 +295,8 @@
   function extractPostsFromDoc(doc, pageNum, pageUrl) {
     const posts = doc.querySelectorAll('article.message, .message[data-content]');
     return Array.from(posts).map(postEl => {
-      const reactions = getReactionCount(postEl);
-      let postDate = null;
-      const timeEl = postEl.querySelector('time[datetime], .message-attribution time, .message-date time, header time');
-      if (timeEl) {
-        const dt = timeEl.getAttribute('datetime');
-        if (dt) postDate = new Date(dt);
-      }
-      const postId = postEl.id || postEl.dataset.content || '';
-      const author = (postEl.querySelector('.message-name, .username') || {}).textContent?.trim() || '';
-      return { reactions, postDate, postId, author, pageNum, pageUrl, isCurrentPage: false };
+      const pd = getPostData(postEl);
+      return { ...pd, el: undefined, pageNum, pageUrl, isCurrentPage: false };
     });
   }
 
@@ -318,12 +312,13 @@
     const baseUrl = getThreadBaseUrl();
     const allPosts = [];
 
+    // Determine current page number once
+    const pageMatch = window.location.pathname.match(/\/page-(\d+)/);
+    const currentPageNum = pageMatch ? parseInt(pageMatch[1], 10) : 1;
+
     // Current page posts (from DOM — these we can scroll to)
     const currentPagePosts = getAllPosts().map(el => {
       const pd = getPostData(el);
-      const currentPath = window.location.pathname;
-      const pageMatch = currentPath.match(/\/page-(\d+)/);
-      const currentPageNum = pageMatch ? parseInt(pageMatch[1], 10) : 1;
       return { ...pd, pageNum: currentPageNum, pageUrl: window.location.href, isCurrentPage: true };
     });
     allPosts.push(...currentPagePosts);
@@ -331,28 +326,25 @@
 
     if (totalPages <= 1) return allPosts;
 
-    // Determine which page number is the current page
-    const currentPath = window.location.pathname;
-    const currentPageMatch = currentPath.match(/\/page-(\d+)/);
-    const currentPageNum = currentPageMatch ? parseInt(currentPageMatch[1], 10) : 1;
-
-    // Fetch all other pages (sequential with small delay to be polite)
+    // Build list of pages to fetch (exclude current)
+    const pagesToFetch = [];
     for (let page = 1; page <= totalPages; page++) {
-      if (page === currentPageNum) continue; // Already have current page
+      if (page !== currentPageNum) pagesToFetch.push(page);
+    }
 
-      const pageUrl = page === 1 ? baseUrl : baseUrl + 'page-' + page;
-      try {
-        const doc = await fetchPage(pageUrl);
-        const posts = extractPostsFromDoc(doc, page, pageUrl);
-        allPosts.push(...posts);
-      } catch (err) {
-        log(`Failed to fetch page ${page}:`, err.message);
-      }
+    // Fetch in batches of 4 for speed, with delay between batches
+    const BATCH_SIZE = 4;
+    for (let i = 0; i < pagesToFetch.length; i += BATCH_SIZE) {
+      const batch = pagesToFetch.slice(i, i + BATCH_SIZE);
+      const results = await Promise.allSettled(batch.map(page => {
+        const pageUrl = page === 1 ? baseUrl : baseUrl + 'page-' + page;
+        return fetchPage(pageUrl).then(doc => extractPostsFromDoc(doc, page, pageUrl));
+      }));
+      results.forEach(r => { if (r.status === 'fulfilled') allPosts.push(...r.value); });
+      onProgress(Math.min(i + BATCH_SIZE, pagesToFetch.length), pagesToFetch.length);
 
-      onProgress(page <= currentPageNum ? page : page, totalPages);
-
-      // Small delay between requests to avoid hammering the server
-      if (page < totalPages) await new Promise(r => setTimeout(r, 300));
+      // Small delay between batches to avoid hammering the server
+      if (i + BATCH_SIZE < pagesToFetch.length) await new Promise(r => setTimeout(r, 300));
     }
 
     return allPosts;
@@ -363,6 +355,27 @@
   // ========================================
   function getAllPosts() {
     return Array.from(document.querySelectorAll('article.message, .message[data-content]'));
+  }
+
+  function sortPosts(posts) {
+    const sorted = [...posts];
+    if (currentSort === 'reactions') sorted.sort((a, b) => b.reactions - a.reactions);
+    else if (currentSort === 'newest') sorted.sort((a, b) => (b.postDate || 0) - (a.postDate || 0));
+    else if (currentSort === 'oldest') sorted.sort((a, b) => (a.postDate || 0) - (b.postDate || 0));
+    return sorted;
+  }
+
+  function clearRankBadges() {
+    document.querySelectorAll(`.${SCRIPT_ID}-rank-badge`).forEach(b => b.remove());
+  }
+
+  function addRankBadge(el, rank, reactions, labelText) {
+    const badge = document.createElement('span');
+    const isTop3 = rank < 3 && reactions > 0;
+    badge.className = `${SCRIPT_ID}-rank-badge${isTop3 ? ' top3' : (reactions === 0 ? ' zero' : '')}`;
+    badge.textContent = labelText;
+    const header = el.querySelector('.message-attribution, .message-userDetails, .message-cell--user, header');
+    if (header) header.appendChild(badge);
   }
 
   function applyFilters() {
@@ -383,20 +396,12 @@
       }
     });
 
-    const sorted = [...visible];
-    if (currentSort === 'reactions') sorted.sort((a, b) => b.reactions - a.reactions);
-    else if (currentSort === 'newest') sorted.sort((a, b) => (b.postDate || 0) - (a.postDate || 0));
-    else if (currentSort === 'oldest') sorted.sort((a, b) => (a.postDate || 0) - (b.postDate || 0));
+    const sorted = sortPosts(visible);
 
-    allData.forEach(pd => pd.el.querySelectorAll(`.${SCRIPT_ID}-rank-badge`).forEach(b => b.remove()));
+    clearRankBadges();
 
     sorted.forEach((pd, rank) => {
-      const badge = document.createElement('span');
-      const isTop3 = rank < 3 && pd.reactions > 0;
-      badge.className = `${SCRIPT_ID}-rank-badge${isTop3 ? ' top3' : (pd.reactions === 0 ? ' zero' : '')}`;
-      badge.textContent = `#${rank + 1} · ❤️ ${pd.reactions}`;
-      const header = pd.el.querySelector('.message-attribution, .message-userDetails, .message-cell--user, header');
-      if (header) header.appendChild(badge);
+      addRankBadge(pd.el, rank, pd.reactions, `#${rank + 1} · ❤️ ${pd.reactions}`);
     });
 
     buildScrollList(sorted);
@@ -407,10 +412,8 @@
 
   function resetFilters() {
     if (!isThreadPage()) return;
-    getAllPosts().forEach(p => {
-      p.classList.remove(`${SCRIPT_ID}-hidden`);
-      p.querySelectorAll(`.${SCRIPT_ID}-rank-badge`).forEach(b => b.remove());
-    });
+    getAllPosts().forEach(p => p.classList.remove(`${SCRIPT_ID}-hidden`));
+    clearRankBadges();
     isActive = false;
     currentDateRange = 'all';
     currentSort = 'reactions';
@@ -502,9 +505,9 @@
 
     // Sort mode selector
     const FORUM_SORT_MODES = [
-      { key: 'reaction_score', label: '🔥 Most Liked', icon: '🔥' },
-      { key: 'view_count',     label: '👁 Most Viewed', icon: '👁' },
-      { key: 'reply_count',    label: '💬 Most Replies', icon: '💬' }
+      { key: 'reaction_score', label: '🔥 Most Liked' },
+      { key: 'view_count',     label: '👁 Most Viewed' },
+      { key: 'reply_count',    label: '💬 Most Replies' }
     ];
 
     const modeLabel = document.createElement('span');
@@ -597,23 +600,14 @@
       }
 
       // Sort
-      const sorted = [...visible];
-      if (currentSort === 'reactions') sorted.sort((a, b) => b.reactions - a.reactions);
-      else if (currentSort === 'newest') sorted.sort((a, b) => (b.postDate || 0) - (a.postDate || 0));
-      else if (currentSort === 'oldest') sorted.sort((a, b) => (a.postDate || 0) - (b.postDate || 0));
+      const sorted = sortPosts(visible);
 
       // Also apply badges to current-page posts
-      const currentPagePosts = getAllPosts();
-      currentPagePosts.forEach(p => p.querySelectorAll(`.${SCRIPT_ID}-rank-badge`).forEach(b => b.remove()));
+      clearRankBadges();
 
       sorted.forEach((pd, rank) => {
         if (pd.isCurrentPage && pd.el) {
-          const badge = document.createElement('span');
-          const isTop3 = rank < 3 && pd.reactions > 0;
-          badge.className = `${SCRIPT_ID}-rank-badge${isTop3 ? ' top3' : (pd.reactions === 0 ? ' zero' : '')}`;
-          badge.textContent = `#${rank + 1}/${allPosts.length} · ❤️ ${pd.reactions}`;
-          const header = pd.el.querySelector('.message-attribution, .message-userDetails, .message-cell--user, header');
-          if (header) header.appendChild(badge);
+          addRankBadge(pd.el, rank, pd.reactions, `#${rank + 1}/${allPosts.length} · ❤️ ${pd.reactions}`);
         }
       });
 
@@ -877,14 +871,18 @@
     }, { passive: true });
     document.addEventListener('touchend', onEnd);
 
-    // Re-clamp on window resize
+    // Re-clamp on window resize (debounced with rAF)
+    let _resizeRaf = null;
     window.addEventListener('resize', () => {
-      if (dragging) return;
-      const currentRight = parseInt(getComputedStyle(panel).right, 10) || 20;
-      const currentBottom = parseInt(getComputedStyle(panel).bottom, 10) || 20;
-      const clamped = clampPosition(currentRight, currentBottom);
-      panel.style.right = clamped.right + 'px';
-      panel.style.bottom = clamped.bottom + 'px';
+      if (dragging || _resizeRaf) return;
+      _resizeRaf = requestAnimationFrame(() => {
+        _resizeRaf = null;
+        const currentRight = parseInt(getComputedStyle(panel).right, 10) || 20;
+        const currentBottom = parseInt(getComputedStyle(panel).bottom, 10) || 20;
+        const clamped = clampPosition(currentRight, currentBottom);
+        panel.style.right = clamped.right + 'px';
+        panel.style.bottom = clamped.bottom + 'px';
+      });
     });
   }
 
@@ -894,7 +892,12 @@
   document.addEventListener('keydown', (e) => {
     if (e.altKey && !e.shiftKey && e.key.toLowerCase() === 'f') {
       e.preventDefault();
-      if (panelEl) { const min = panelEl.classList.toggle('minimized'); GM_setValue(`${SCRIPT_ID}_minimized`, min); }
+      if (panelEl) {
+        const min = panelEl.classList.toggle('minimized');
+        const btn = panelEl.querySelector(`.${SCRIPT_ID}-header-btn`);
+        if (btn) btn.textContent = min ? '+' : '−';
+        GM_setValue(`${SCRIPT_ID}_minimized`, min);
+      }
     }
     if (e.altKey && e.shiftKey && e.key.toLowerCase() === 'f') {
       e.preventDefault();
