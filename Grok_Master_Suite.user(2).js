@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Grok Master Suite
 // @namespace    https://github.com/taylorfunk/grok-suite
-// @version      1.0.0
-// @description  Consolidated Grok suite: Prompt Manager + Video Gen Overrides + AI Enhancement (OpenRouter) + Multi-Image Queue + Auto-Retry + Offline Video DB + MP4 Download
+// @version      1.1.0
+// @description  Consolidated Grok suite: Prompt Manager + Video Gen Overrides + AI Enhancement (OpenRouter) + Multi-Image Queue + Auto-Retry + Offline Video DB + MP4 Download. Cached DB, memory leak fixes, optimized observers.
 // @author       Taylor Funk
 // @license      MIT
 // @match        https://grok.com/*
@@ -470,17 +470,49 @@
     let isAutoRetryClick = false;
     let currentVideoInputText = '';
 
-    // Store blob URLs for video playback in lightbox
+    // Store blob URLs for video playback in lightbox (max 20 cached, LRU eviction)
+    const MAX_BLOB_CACHE = 20;
     let capturedVideoBlobUrls = {};
+    let _blobAccessOrder = [];
+
+    function cacheBlobUrl(promptId, blobUrl) {
+      // Evict oldest if at capacity
+      if (!capturedVideoBlobUrls[promptId] && _blobAccessOrder.length >= MAX_BLOB_CACHE) {
+        const evictId = _blobAccessOrder.shift();
+        if (capturedVideoBlobUrls[evictId]) {
+          try { URL.revokeObjectURL(capturedVideoBlobUrls[evictId]); } catch (e) {}
+          delete capturedVideoBlobUrls[evictId];
+        }
+      }
+      capturedVideoBlobUrls[promptId] = blobUrl;
+      // Move to end of access order
+      _blobAccessOrder = _blobAccessOrder.filter(id => id !== promptId);
+      _blobAccessOrder.push(promptId);
+    }
+
+    // Clean up all blob URLs on page unload
+    window.addEventListener('beforeunload', () => {
+      Object.values(capturedVideoBlobUrls).forEach(url => {
+        try { URL.revokeObjectURL(url); } catch (e) {}
+      });
+    });
 
     // --- HELPERS ---
-    function showToast(message, type = 'success') {
-      let container = document.querySelector('.grok-toast-container');
-      if (!container) {
-        container = document.createElement('div');
-        container.className = 'grok-toast-container';
-        document.body.appendChild(container);
+    // Create toast container eagerly to avoid DOM lookup on every toast
+    let _toastContainer = null;
+    function _ensureToastContainer() {
+      if (_toastContainer && _toastContainer.isConnected) return _toastContainer;
+      _toastContainer = document.querySelector('.grok-toast-container');
+      if (!_toastContainer) {
+        _toastContainer = document.createElement('div');
+        _toastContainer.className = 'grok-toast-container';
+        document.body.appendChild(_toastContainer);
       }
+      return _toastContainer;
+    }
+
+    function showToast(message, type = 'success') {
+      const container = _ensureToastContainer();
       const toast = document.createElement('div');
       toast.className = 'grok-toast';
       if(type === 'error' || type === 'mod') toast.style.background = 'var(--grok-danger)';
@@ -519,8 +551,16 @@
       GM_setValue('grok_categories_v2', JSON.stringify(cats));
       GM_setValue('grok_categories', JSON.stringify(cats.map(c => c.name)));
     }
-    function getPrompts() { return JSON.parse(GM_getValue('grok_prompts', '[]')); }
-    function savePrompts(prompts) { GM_setValue('grok_prompts', JSON.stringify(prompts)); }
+    let _promptsCache = null;
+    function getPrompts() {
+      if (_promptsCache) return _promptsCache.map(p => ({ ...p }));
+      _promptsCache = JSON.parse(GM_getValue('grok_prompts', '[]'));
+      return _promptsCache.map(p => ({ ...p }));
+    }
+    function savePrompts(prompts) {
+      _promptsCache = prompts;
+      GM_setValue('grok_prompts', JSON.stringify(prompts));
+    }
 
     function migratePrompt(p) {
       if (!p.stats) p.stats = { attempts: 0, moderated: 0 };
@@ -529,18 +569,40 @@
       return p;
     }
 
+    const _settingsDefaults = {
+      autoTrack: true, silentMode: false, floatingMode: false, useAutoStats: true,
+      disableVideoLoop: false, hideVideoControls: false, openOnLaunch: true,
+      retryEnabled: false, maxRetries: 3, showMediaPreviews: true, showSourceImage: false,
+      keybind: { key: 'l', altKey: false, ctrlKey: true, shiftKey: false, metaKey: false },
+      sidePanelKeybind: { key: 'k', altKey: true, ctrlKey: false, shiftKey: false, metaKey: false }
+    };
+    let _settingsCache = null;
+
     function getSettings() {
-      const defaults = {
-        autoTrack: true, silentMode: false, floatingMode: false, useAutoStats: true,
-        disableVideoLoop: false, hideVideoControls: false, openOnLaunch: true,
-        retryEnabled: false, maxRetries: 3, showMediaPreviews: true, showSourceImage: false,
-        keybind: { key: 'l', altKey: false, ctrlKey: true, shiftKey: false, metaKey: false },
-        sidePanelKeybind: { key: 'k', altKey: true, ctrlKey: false, shiftKey: false, metaKey: false }
-      };
+      if (_settingsCache) return { ..._settingsCache };
       const saved = JSON.parse(GM_getValue('grok_settings', '{}'));
-      return { ...defaults, ...saved };
+      _settingsCache = { ..._settingsDefaults, ...saved };
+      return { ..._settingsCache };
     }
-    function saveSettings(s) { GM_setValue('grok_settings', JSON.stringify(s)); }
+    function saveSettings(s) {
+      _settingsCache = { ..._settingsDefaults, ...s };
+      GM_setValue('grok_settings', JSON.stringify(s));
+    }
+
+    // Reusable sort comparators for prompt lists
+    function sortBySuccessRate(a, b, ascending = false) {
+      const pA = migratePrompt(a), pB = migratePrompt(b);
+      const rA = pA.stats.attempts ? ((pA.stats.attempts - pA.stats.moderated) / pA.stats.attempts) : 0;
+      const rB = pB.stats.attempts ? ((pB.stats.attempts - pB.stats.moderated) / pB.stats.attempts) : 0;
+      if (rA !== rB) return ascending ? (rA - rB) : (rB - rA);
+      return ascending ? (pB.stats.moderated - pA.stats.moderated) : (pB.stats.attempts - pA.stats.attempts);
+    }
+
+    function sortByModeration(a, b, ascending = false) {
+      return ascending
+        ? ((migratePrompt(a).moderation || 0) - (migratePrompt(b).moderation || 0))
+        : ((migratePrompt(b).moderation || 0) - (migratePrompt(a).moderation || 0));
+    }
 
     function getKeybindString(kb) {
       if (!kb) return 'Ctrl + L';
@@ -755,9 +817,15 @@ Return ONLY the cleaned JSON.`;
             temperature: 0.7,
             max_tokens: 1500
           }),
+          timeout: 30000,
           onload: (res) => {
             try {
               const data = JSON.parse(res.responseText);
+              if (data.error) {
+                showToast(`AI error: ${data.error.message || 'Unknown'}`, 'error');
+                resolve(null);
+                return;
+              }
               const content = data.choices?.[0]?.message?.content;
               if (content) {
                 const cleaned = content.replace(/```json\n?/g, '').replace(/```\n?/g, '').trim();
@@ -771,7 +839,8 @@ Return ONLY the cleaned JSON.`;
               resolve(null);
             }
           },
-          onerror: () => { showToast('AI request failed', 'error'); resolve(null); }
+          onerror: () => { showToast('AI request failed', 'error'); resolve(null); },
+          ontimeout: () => { showToast('AI request timed out (30s)', 'error'); resolve(null); }
         });
       });
     }
@@ -873,14 +942,21 @@ Return ONLY the cleaned JSON.`;
     // ============================
     const DB_NAME = 'GrokVideoDB';
     const STORE_NAME = 'videos';
+    let _dbInstance = null;
 
     function openDB() {
+      if (_dbInstance) return Promise.resolve(_dbInstance);
       return new Promise((resolve, reject) => {
         const request = indexedDB.open(DB_NAME, 1);
         request.onupgradeneeded = (e) => {
           e.target.result.createObjectStore(STORE_NAME);
         };
-        request.onsuccess = () => resolve(request.result);
+        request.onsuccess = () => {
+          _dbInstance = request.result;
+          _dbInstance.onclose = () => { _dbInstance = null; };
+          _dbInstance.onversionchange = () => { _dbInstance.close(); _dbInstance = null; };
+          resolve(_dbInstance);
+        };
         request.onerror = () => reject(request.error);
       });
     }
@@ -1953,7 +2029,9 @@ Return ONLY the cleaned JSON.`;
 
     // --- MutationObserver for Context Buttons ---
     function gsSetupObserver() {
+      let _checkTimer = null;
       const checkAndCreate = () => {
+        if (document.visibilityState === 'hidden') return;
         const input = gsGetVideoInput();
         const existing = document.querySelector('.gs-context');
         if (input) {
@@ -1967,8 +2045,8 @@ Return ONLY the cleaned JSON.`;
         }
       };
       const observer = new MutationObserver(() => {
-        clearTimeout(observer._timeout);
-        observer._timeout = setTimeout(checkAndCreate, 150);
+        if (_checkTimer) return;
+        _checkTimer = setTimeout(() => { _checkTimer = null; checkAndCreate(); }, 200);
       });
       observer.observe(document.body, { childList: true, subtree: true });
       checkAndCreate();
@@ -2044,7 +2122,7 @@ Return ONLY the cleaned JSON.`;
           const thumbnail = canvas.toDataURL('image/jpeg', 0.8);
 
           tempVideo.remove();
-          capturedVideoBlobUrls[promptId] = blobUrl; // keep in memory for session
+          cacheBlobUrl(promptId, blobUrl); // keep in memory for session (LRU cached)
 
           let prompts = getPrompts();
           const idx = prompts.findIndex(p => p.id === promptId);
@@ -2086,7 +2164,7 @@ Return ONLY the cleaned JSON.`;
 
       if (storedBlob) {
         const blobUrl = URL.createObjectURL(storedBlob);
-        capturedVideoBlobUrls[promptId] = blobUrl; // Cache for current session
+        cacheBlobUrl(promptId, blobUrl); // Cache for current session (LRU)
         openVideoLightbox(lightbox, blobUrl);
       } else {
         // Fallback incase it wasn't saved locally or DB got cleared
@@ -2131,11 +2209,14 @@ Return ONLY the cleaned JSON.`;
 
       showToast('Downloading video…', 'retry');
 
-      // Native fetch approach
+      // Native fetch approach with error handling
       if (url.startsWith('blob:')) {
-        fetch(url).then(res => res.blob()).then(blob => {
+        fetch(url).then(res => {
+          if (!res.ok) throw new Error(`HTTP ${res.status}`);
+          return res.blob();
+        }).then(blob => {
           triggerDownload(blob);
-        }).catch(() => fallbackDownload(url));
+        }).catch((err) => { console.error('[GrokSuite] Blob fetch failed:', err); fallbackDownload(url); });
       } else {
         GM_xmlhttpRequest({
           method: 'GET', url: url, responseType: 'blob',
@@ -2470,7 +2551,7 @@ Return ONLY the cleaned JSON.`;
         if (now - lastProgressScanTs > 400) { lastProgressScanTs = now; try { detectGenerationProgress(); } catch (e) {} }
       });
 
-      observer.observe(document.body, { childList: true, subtree: true, attributes: true });
+      observer.observe(document.body, { childList: true, subtree: true });
       window.addEventListener('beforeunload', () => observer.disconnect());
 
       document.addEventListener('keydown', (e) => {
@@ -3144,21 +3225,9 @@ Return ONLY the cleaned JSON.`;
         }
 
         if (historySortMode === 'high') {
-          prompts.sort((a, b) => {
-            const pA = migratePrompt(a), pB = migratePrompt(b);
-            const rA = pA.stats.attempts ? ((pA.stats.attempts - pA.stats.moderated)/pA.stats.attempts) : 0;
-            const rB = pB.stats.attempts ? ((pB.stats.attempts - pB.stats.moderated)/pB.stats.attempts) : 0;
-            if (rA !== rB) return rB - rA;
-            return pB.stats.attempts - pA.stats.attempts;
-          });
+          prompts.sort((a, b) => sortBySuccessRate(a, b, false));
         } else if (historySortMode === 'low') {
-          prompts.sort((a, b) => {
-            const pA = migratePrompt(a), pB = migratePrompt(b);
-            const rA = pA.stats.attempts ? ((pA.stats.attempts - pA.stats.moderated)/pA.stats.attempts) : 0;
-            const rB = pB.stats.attempts ? ((pB.stats.attempts - pB.stats.moderated)/pB.stats.attempts) : 0;
-            if (rA !== rB) return rA - rB;
-            return pB.stats.moderated - pA.stats.moderated;
-          });
+          prompts.sort((a, b) => sortBySuccessRate(a, b, true));
         } else {
           prompts.sort((a, b) => b.timestamp - a.timestamp);
         }
@@ -3190,27 +3259,9 @@ Return ONLY the cleaned JSON.`;
           </div>`;
         if (videoFilterCategory !== 'all') prompts = prompts.filter(p => p.category === videoFilterCategory);
         if (videoSortMode === 'high') {
-          prompts.sort((a, b) => {
-            const pA = migratePrompt(a), pB = migratePrompt(b);
-            if(s.useAutoStats) {
-              const rA = pA.stats.attempts ? ((pA.stats.attempts - pA.stats.moderated)/pA.stats.attempts) : 0;
-              const rB = pB.stats.attempts ? ((pB.stats.attempts - pB.stats.moderated)/pB.stats.attempts) : 0;
-              if (rA !== rB) return rB - rA;
-              return pB.stats.attempts - pA.stats.attempts;
-            }
-            return (pB.moderation || 0) - (pA.moderation || 0);
-          });
+          prompts.sort((a, b) => s.useAutoStats ? sortBySuccessRate(a, b, false) : sortByModeration(a, b, false));
         } else if (videoSortMode === 'low') {
-          prompts.sort((a, b) => {
-            const pA = migratePrompt(a), pB = migratePrompt(b);
-            if(s.useAutoStats) {
-              const rA = pA.stats.attempts ? ((pA.stats.attempts - pA.stats.moderated)/pA.stats.attempts) : 0;
-              const rB = pB.stats.attempts ? ((pB.stats.attempts - pB.stats.moderated)/pB.stats.attempts) : 0;
-              if (rA !== rB) return rA - rB;
-              return pB.stats.moderated - pA.stats.moderated;
-            }
-            return (pA.moderation || 0) - (pB.moderation || 0);
-          });
+          prompts.sort((a, b) => s.useAutoStats ? sortBySuccessRate(a, b, true) : sortByModeration(a, b, true));
         } else {
           prompts.sort((a, b) => b.timestamp - a.timestamp);
         }
@@ -3238,8 +3289,8 @@ Return ONLY the cleaned JSON.`;
             </div>
           </div>`;
         if (imageFilterCategory !== 'all') prompts = prompts.filter(p => p.category === imageFilterCategory);
-        if (imageSortMode === 'high') prompts.sort((a, b) => (migratePrompt(b).moderation || 0) - (migratePrompt(a).moderation || 0));
-        else if (imageSortMode === 'low') prompts.sort((a, b) => (migratePrompt(a).moderation || 0) - (migratePrompt(b).moderation || 0));
+        if (imageSortMode === 'high') prompts.sort((a, b) => sortByModeration(a, b, false));
+        else if (imageSortMode === 'low') prompts.sort((a, b) => sortByModeration(a, b, true));
         else prompts.sort((a, b) => b.timestamp - a.timestamp);
         if (prompts.length === 0) {
           container.innerHTML = controlsHTML + `<div style="text-align:center; color:#666; padding:40px;">No image prompts saved yet.</div>`;
@@ -4184,7 +4235,21 @@ Return ONLY the cleaned JSON.`;
     initConsolidatedModules();
   }
 
-  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', initScript);
-  else initScript();
+  function safeInit() {
+    try {
+      initScript();
+    } catch (e) {
+      console.error('[GrokSuite] FATAL: Script initialization failed:', e);
+      // Show a visible error so the user knows something went wrong
+      const errDiv = document.createElement('div');
+      errDiv.style.cssText = 'position:fixed;bottom:20px;right:20px;background:#1a1a2e;color:#f4212e;padding:12px 20px;border-radius:10px;z-index:99999;font-family:sans-serif;font-size:13px;border:1px solid #f4212e;box-shadow:0 4px 12px rgba(0,0,0,0.5);cursor:pointer;';
+      errDiv.textContent = '[GrokSuite] Init failed — check console (click to dismiss)';
+      errDiv.onclick = () => errDiv.remove();
+      document.body.appendChild(errDiv);
+    }
+  }
+
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', safeInit);
+  else safeInit();
 
 })();
