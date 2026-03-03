@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         SimpCity Post & Thread Filter
 // @namespace    https://github.com/taylorfunk/simpcity-tools
-// @version      2.0.0
-// @description  Sort threads and posts by most liked/reactions with date filtering. Forum lists use native XenForo sorting. Thread view highlights and ranks posts with jump-to links (no DOM reordering = no broken handlers).
+// @version      2.1.0
+// @description  Sort threads and posts by most liked/reactions with date filtering. Forum lists use native XenForo sorting. Thread view highlights and ranks posts with jump-to links (no DOM reordering = no broken handlers). Touch/mobile support, boundary-clamped panel.
 // @author       Taylor Funk
 // @license      MIT
 // @match        https://simpcity.cr/*
@@ -133,6 +133,10 @@
   function log(...args) { console.log(LOG_PREFIX, ...args); }
   function isThreadPage() { return !!document.querySelector('article.message, .message[data-content]'); }
   function isForumListPage() { return !!document.querySelector('.structItem--thread') && !isThreadPage(); }
+
+  // Active highlight timer - prevents stacking when clicking scroll items rapidly
+  let _highlightTimer = null;
+  let _highlightedEl = null;
 
   function getDateCutoff(rangeKey) {
     const range = DATE_RANGES[rangeKey];
@@ -269,6 +273,7 @@
     const container = document.getElementById(`${SCRIPT_ID}-scroll-list`);
     if (!container) return;
     container.innerHTML = '';
+    const fragment = document.createDocumentFragment();
     sorted.slice(0, 20).forEach((pd, rank) => {
       const item = document.createElement('div');
       item.className = `${SCRIPT_ID}-scroll-item`;
@@ -285,12 +290,18 @@
       item.appendChild(info);
       item.appendChild(count);
       item.onclick = () => {
+        // Clear previous highlight before applying new one
+        if (_highlightTimer) { clearTimeout(_highlightTimer); }
+        if (_highlightedEl) { _highlightedEl.style.outline = ''; _highlightedEl.style.outlineOffset = ''; }
         pd.el.scrollIntoView({ behavior: 'smooth', block: 'center' });
         pd.el.style.outline = '2px solid #3aff9d';
-        setTimeout(() => { pd.el.style.outline = ''; }, 2000);
+        pd.el.style.outlineOffset = '4px';
+        _highlightedEl = pd.el;
+        _highlightTimer = setTimeout(() => { pd.el.style.outline = ''; pd.el.style.outlineOffset = ''; _highlightedEl = null; _highlightTimer = null; }, 2500);
       };
-      container.appendChild(item);
+      fragment.appendChild(item);
     });
+    container.appendChild(fragment);
   }
 
   function clearScrollList() {
@@ -350,25 +361,37 @@
     if (panelEl || !isThreadPage()) return;
     const panel = document.createElement('div');
     panel.className = `${SCRIPT_ID}-panel`;
-    if (GM_getValue(`${SCRIPT_ID}_minimized`, false)) panel.classList.add('minimized');
+    const isMinimized = GM_getValue(`${SCRIPT_ID}_minimized`, false);
+    if (isMinimized) panel.classList.add('minimized');
 
-    // Restore saved position from drag
+    // Restore saved position from drag (with viewport bounds check)
     const savedPos = GM_getValue(`${SCRIPT_ID}_panelPos`, null);
     if (savedPos) {
-      if (savedPos.right) panel.style.right = savedPos.right;
-      if (savedPos.bottom) panel.style.bottom = savedPos.bottom;
+      const savedRight = parseInt(savedPos.right, 10);
+      const savedBottom = parseInt(savedPos.bottom, 10);
+      if (!isNaN(savedRight) && savedRight >= 0 && savedRight < window.innerWidth) panel.style.right = savedPos.right;
+      if (!isNaN(savedBottom) && savedBottom >= 0 && savedBottom < window.innerHeight) panel.style.bottom = savedPos.bottom;
     }
 
     const header = document.createElement('div');
     header.className = `${SCRIPT_ID}-header`;
     const title = document.createElement('div');
     title.className = `${SCRIPT_ID}-title`;
-    title.textContent = '🔥 Post Filter';
+    title.innerHTML = '🔥 Post Filter';
+    const postCountBadge = document.createElement('span');
+    postCountBadge.id = `${SCRIPT_ID}-post-count-badge`;
+    postCountBadge.style.cssText = 'background: rgba(58,255,157,0.15); color: #3aff9d; font-size: 10px; padding: 2px 7px; border-radius: 10px; font-weight: 700; display: none;';
+    title.appendChild(postCountBadge);
     const minimizeBtn = document.createElement('button');
     minimizeBtn.className = `${SCRIPT_ID}-header-btn`;
     minimizeBtn.title = 'Minimize (Alt+F)';
     minimizeBtn.textContent = '−';
-    minimizeBtn.onclick = () => { const min = panel.classList.toggle('minimized'); GM_setValue(`${SCRIPT_ID}_minimized`, min); };
+    minimizeBtn.onclick = () => {
+      const min = panel.classList.toggle('minimized');
+      minimizeBtn.textContent = min ? '+' : '−';
+      GM_setValue(`${SCRIPT_ID}_minimized`, min);
+    };
+    if (isMinimized) minimizeBtn.textContent = '+';
     header.appendChild(title);
     header.appendChild(minimizeBtn);
     panel.appendChild(header);
@@ -469,32 +492,85 @@
     const el = document.getElementById(`${SCRIPT_ID}-stats`);
     if (!el) return;
     el.textContent = reset ? 'Filters cleared' : `Showing ${showing} of ${total} posts${hidden > 0 ? ` (${hidden} hidden)` : ''}`;
+
+    // Update minimized badge
+    const badge = document.getElementById(`${SCRIPT_ID}-post-count-badge`);
+    if (badge) {
+      if (reset || total === 0) { badge.style.display = 'none'; }
+      else { badge.textContent = `${showing}/${total}`; badge.style.display = 'inline'; }
+    }
   }
 
   // ========================================
-  // DRAGGABLE
+  // DRAGGABLE (with boundary clamping + touch support)
   // ========================================
   function makeDraggable(panel, handle) {
     let dragging = false, startX, startY, startRight, startBottom;
-    handle.addEventListener('mousedown', (e) => {
-      if (e.target.closest('button')) return;
+
+    function clampPosition(right, bottom) {
+      const panelRect = panel.getBoundingClientRect();
+      const maxRight = Math.max(0, window.innerWidth - panelRect.width);
+      const maxBottom = Math.max(0, window.innerHeight - panelRect.height);
+      return {
+        right: Math.max(0, Math.min(maxRight, right)),
+        bottom: Math.max(0, Math.min(maxBottom, bottom))
+      };
+    }
+
+    function onStart(clientX, clientY) {
       dragging = true;
-      startX = e.clientX; startY = e.clientY;
+      startX = clientX; startY = clientY;
       startRight = parseInt(getComputedStyle(panel).right, 10) || 20;
       startBottom = parseInt(getComputedStyle(panel).bottom, 10) || 20;
       document.body.style.userSelect = 'none';
-      e.preventDefault();
-    });
-    document.addEventListener('mousemove', (e) => {
+    }
+
+    function onMove(clientX, clientY) {
       if (!dragging) return;
-      panel.style.right = Math.max(0, startRight + (startX - e.clientX)) + 'px';
-      panel.style.bottom = Math.max(0, startBottom + (startY - e.clientY)) + 'px';
-    });
-    document.addEventListener('mouseup', () => {
+      const rawRight = startRight + (startX - clientX);
+      const rawBottom = startBottom + (startY - clientY);
+      const clamped = clampPosition(rawRight, rawBottom);
+      panel.style.right = clamped.right + 'px';
+      panel.style.bottom = clamped.bottom + 'px';
+    }
+
+    function onEnd() {
       if (!dragging) return;
       dragging = false;
       document.body.style.userSelect = '';
       GM_setValue(`${SCRIPT_ID}_panelPos`, { right: panel.style.right, bottom: panel.style.bottom });
+    }
+
+    // Mouse events
+    handle.addEventListener('mousedown', (e) => {
+      if (e.target.closest('button')) return;
+      e.preventDefault();
+      onStart(e.clientX, e.clientY);
+    });
+    document.addEventListener('mousemove', (e) => onMove(e.clientX, e.clientY));
+    document.addEventListener('mouseup', onEnd);
+
+    // Touch events for mobile
+    handle.addEventListener('touchstart', (e) => {
+      if (e.target.closest('button')) return;
+      const t = e.touches[0];
+      onStart(t.clientX, t.clientY);
+    }, { passive: true });
+    document.addEventListener('touchmove', (e) => {
+      if (!dragging) return;
+      const t = e.touches[0];
+      onMove(t.clientX, t.clientY);
+    }, { passive: true });
+    document.addEventListener('touchend', onEnd);
+
+    // Re-clamp on window resize
+    window.addEventListener('resize', () => {
+      if (dragging) return;
+      const currentRight = parseInt(getComputedStyle(panel).right, 10) || 20;
+      const currentBottom = parseInt(getComputedStyle(panel).bottom, 10) || 20;
+      const clamped = clampPosition(currentRight, currentBottom);
+      panel.style.right = clamped.right + 'px';
+      panel.style.bottom = clamped.bottom + 'px';
     });
   }
 
