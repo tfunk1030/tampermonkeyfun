@@ -179,39 +179,71 @@
   // REACTION COUNT EXTRACTION
   // ========================================
   function getReactionCount(postEl) {
-    const reactionsBar = postEl.querySelector('.reactionsBar');
+    // CRITICAL: Scope to .message-cell--main to avoid picking up the user's
+    // lifetime "Reaction score" from .message-cell--user sidebar.
+    // In XenForo 2.x each article.message has:
+    //   .message-cell--user  → user stats (Messages, Reaction score, Points)
+    //   .message-cell--main  → actual post content + per-post reactions
+    const scopeEl = postEl.querySelector('.message-cell--main, .message-content, .message-body') || postEl;
+
+    // 1) Standard XenForo reactions bar (below post content)
+    const reactionsBar = scopeEl.querySelector('.reactionsBar');
     if (reactionsBar) {
       const link = reactionsBar.querySelector('.reactionsBar-link');
       if (link) {
-        const match = link.textContent.match(/(\d+)/);
-        if (match) return parseInt(match[1], 10);
+        const text = link.textContent.trim();
+        // Format: "UserA, UserB and 5 others" → count named users + N others
+        const othersMatch = text.match(/and\s+(\d[\d,]*)\s+other/i);
+        if (othersMatch) {
+          const othersCount = parseInt(othersMatch[1].replace(/,/g, ''), 10);
+          // Count named users before "and X others" (comma-separated <bdi> or text)
+          const beforeAnd = text.split(/\s+and\s+/i)[0];
+          const namedUsers = beforeAnd ? beforeAnd.split(',').filter(s => s.trim()).length : 0;
+          return namedUsers + othersCount;
+        }
+        // Format: "UserA and UserB" (no "others") → 2 people
+        if (text.match(/\s+and\s+/i) && !text.match(/other/i)) {
+          return 2;
+        }
+        // Format: just "UserA" → 1 reaction
+        if (text.length > 0 && !text.match(/^\d/)) {
+          return 1;
+        }
+        // Format: plain number like "7 reactions"
+        const numMatch = text.match(/^(\d[\d,]*)/);
+        if (numMatch) return parseInt(numMatch[1].replace(/,/g, ''), 10);
       }
-      const icons = reactionsBar.querySelectorAll('.reaction--small, .reaction, [data-reaction-id]');
+
+      // Fallback: count individual reaction icons in the bar
+      const icons = reactionsBar.querySelectorAll('.reaction--small, [data-reaction-id]');
       if (icons.length > 0) {
         let total = 0;
         icons.forEach(icon => {
           const countEl = icon.querySelector('.reaction-count, .u-srOnly');
-          const m = countEl ? countEl.textContent.match(/(\d+)/) : null;
-          total += m ? parseInt(m[1], 10) : 1;
+          const m = countEl ? countEl.textContent.match(/(\d[\d,]*)/) : null;
+          total += m ? parseInt(m[1].replace(/,/g, ''), 10) : 1;
         });
         return total;
       }
     }
 
-    const likesList = postEl.querySelector('.message-likes, .js-reactionsList, .likesBar');
+    // 2) Older XenForo likes bar — still scoped to main content area
+    const likesList = scopeEl.querySelector('.message-likes, .likesBar');
     if (likesList) {
       const text = likesList.textContent.trim();
-      const m1 = text.match(/and\s+(\d+)\s+other/i);
-      if (m1) return parseInt(m1[1], 10) + 1;
-      const m2 = text.match(/(\d+)\s*(reaction|like|people)/i);
-      if (m2) return parseInt(m2[1], 10);
-      if (text.length > 0 && text.match(/[a-zA-Z]/)) {
-        const names = text.split(',').length;
-        if (names >= 1) return names;
+      const m1 = text.match(/and\s+(\d[\d,]*)\s+other/i);
+      if (m1) {
+        const others = parseInt(m1[1].replace(/,/g, ''), 10);
+        const beforeAnd = text.split(/\s+and\s+/i)[0];
+        const named = beforeAnd ? beforeAnd.split(',').filter(s => s.trim()).length : 0;
+        return named + others;
       }
+      const m2 = text.match(/(\d[\d,]*)\s*(reaction|like|people)/i);
+      if (m2) return parseInt(m2[1].replace(/,/g, ''), 10);
     }
 
-    const dataEl = postEl.querySelector('[data-reaction-count]');
+    // 3) Data attribute fallback — scoped
+    const dataEl = scopeEl.querySelector('[data-reaction-count]');
     if (dataEl) return parseInt(dataEl.dataset.reactionCount, 10) || 0;
 
     return 0;
