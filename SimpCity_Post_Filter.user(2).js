@@ -1,0 +1,526 @@
+// ==UserScript==
+// @name         SimpCity Post & Thread Filter
+// @namespace    https://github.com/taylorfunk/simpcity-tools
+// @version      2.0.0
+// @description  Sort threads and posts by most liked/reactions with date filtering. Forum lists use native XenForo sorting. Thread view highlights and ranks posts with jump-to links (no DOM reordering = no broken handlers).
+// @author       Taylor Funk
+// @license      MIT
+// @match        https://simpcity.cr/*
+// @match        https://simpcity.su/*
+// @match        https://simpcity.li/*
+// @grant        GM_addStyle
+// @grant        GM_getValue
+// @grant        GM_setValue
+// @noframes
+// @run-at       document-idle
+// ==/UserScript==
+
+(function () {
+  'use strict';
+
+  const SCRIPT_ID = 'scpf';
+  const LOG_PREFIX = '[SCPostFilter]';
+
+  const DATE_RANGES = {
+    all:     { label: 'All Time',   days: 0 },
+    today:   { label: 'Today',      days: 1 },
+    week:    { label: 'This Week',  days: 7 },
+    month:   { label: 'This Month', days: 30 },
+    quarter: { label: '3 Months',   days: 90 },
+    year:    { label: 'This Year',  days: 365 }
+  };
+
+  const SORT_MODES = {
+    reactions: { label: '🔥 Most Liked',   key: 'reactions' },
+    newest:    { label: '🕐 Newest First',  key: 'newest' },
+    oldest:    { label: '📅 Oldest First',  key: 'oldest' }
+  };
+
+  let currentDateRange = GM_getValue(`${SCRIPT_ID}_dateRange`, 'all');
+  let currentSort = GM_getValue(`${SCRIPT_ID}_sort`, 'reactions');
+  let isActive = false;
+  let panelEl = null;
+
+  // ========================================
+  // STYLES
+  // ========================================
+  GM_addStyle(`
+    .${SCRIPT_ID}-panel {
+      position: fixed; bottom: 20px; right: 20px; z-index: 99999;
+      background: rgba(18, 18, 18, 0.97); border: 1px solid #2b2b2b; border-radius: 14px;
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      color: #e6e6e6; box-shadow: 0 8px 32px rgba(0,0,0,0.6);
+      min-width: 260px; backdrop-filter: blur(8px); user-select: none;
+    }
+    .${SCRIPT_ID}-panel.minimized .${SCRIPT_ID}-body { display: none; }
+
+    .${SCRIPT_ID}-header {
+      display: flex; justify-content: space-between; align-items: center; padding: 10px 14px;
+      background: linear-gradient(135deg, #1a1a1a 0%, #111 100%);
+      border-radius: 14px 14px 0 0; cursor: move; border-bottom: 1px solid #2b2b2b;
+    }
+    .${SCRIPT_ID}-panel.minimized .${SCRIPT_ID}-header { border-radius: 14px; border-bottom: none; }
+    .${SCRIPT_ID}-title { font-weight: 700; font-size: 13px; color: #3aff9d; display: flex; align-items: center; gap: 6px; }
+    .${SCRIPT_ID}-header-btn {
+      background: none; border: none; color: #666; cursor: pointer; font-size: 16px; padding: 2px 4px;
+      line-height: 1; border-radius: 4px; transition: color 0.15s, background 0.15s;
+    }
+    .${SCRIPT_ID}-header-btn:hover { color: #fff; background: rgba(255,255,255,0.08); }
+
+    .${SCRIPT_ID}-body { padding: 12px 14px; display: flex; flex-direction: column; gap: 10px; }
+    .${SCRIPT_ID}-section-label { font-size: 10px; font-weight: 600; color: #666; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 4px; }
+
+    .${SCRIPT_ID}-pills { display: flex; flex-wrap: wrap; gap: 5px; }
+    .${SCRIPT_ID}-pill {
+      background: #1c1c1c; border: 1px solid #333; border-radius: 20px;
+      padding: 5px 11px; font-size: 11px; font-weight: 600; cursor: pointer; color: #aaa; transition: all 0.15s;
+    }
+    .${SCRIPT_ID}-pill:hover { border-color: #555; color: #ddd; }
+    .${SCRIPT_ID}-pill.active { background: rgba(58, 255, 157, 0.1); border-color: #3aff9d; color: #3aff9d; }
+
+    .${SCRIPT_ID}-sort-row { display: flex; gap: 5px; }
+    .${SCRIPT_ID}-sort-btn {
+      flex: 1; background: #1c1c1c; border: 1px solid #333; border-radius: 8px;
+      padding: 7px 6px; font-size: 11px; font-weight: 600; cursor: pointer; color: #aaa; text-align: center; transition: all 0.15s;
+    }
+    .${SCRIPT_ID}-sort-btn:hover { border-color: #555; color: #ddd; }
+    .${SCRIPT_ID}-sort-btn.active { background: rgba(59, 130, 246, 0.12); border-color: #3b82f6; color: #60a5fa; }
+
+    .${SCRIPT_ID}-actions { display: flex; gap: 6px; margin-top: 2px; }
+    .${SCRIPT_ID}-apply-btn {
+      flex: 1; background: linear-gradient(135deg, #10b981 0%, #059669 100%); border: none; border-radius: 8px;
+      padding: 9px; color: white; font-size: 12px; font-weight: 700; cursor: pointer; transition: filter 0.15s;
+    }
+    .${SCRIPT_ID}-apply-btn:hover { filter: brightness(1.1); }
+    .${SCRIPT_ID}-reset-btn {
+      background: #1c1c1c; border: 1px solid #333; border-radius: 8px;
+      padding: 9px 14px; color: #888; font-size: 12px; font-weight: 600; cursor: pointer; transition: all 0.15s;
+    }
+    .${SCRIPT_ID}-reset-btn:hover { border-color: #ef4444; color: #ef4444; }
+
+    .${SCRIPT_ID}-stats { font-size: 10px; color: #555; text-align: center; padding-top: 4px; border-top: 1px solid #222; }
+
+    .${SCRIPT_ID}-rank-badge {
+      display: inline-flex; align-items: center; gap: 4px;
+      background: rgba(58, 255, 157, 0.08); border: 1px solid rgba(58, 255, 157, 0.2);
+      border-radius: 6px; padding: 3px 8px; font-size: 11px; font-weight: 700; color: #3aff9d; margin-left: 8px;
+    }
+    .${SCRIPT_ID}-rank-badge.top3 { background: rgba(245, 158, 11, 0.12); border-color: rgba(245, 158, 11, 0.3); color: #f59e0b; }
+    .${SCRIPT_ID}-rank-badge.zero { background: rgba(100, 100, 100, 0.08); border-color: rgba(100, 100, 100, 0.2); color: #555; }
+
+    .${SCRIPT_ID}-scroll-list { max-height: 160px; overflow-y: auto; margin-top: 6px; }
+    .${SCRIPT_ID}-scroll-item {
+      display: flex; align-items: center; gap: 6px; padding: 5px 8px; border-radius: 6px;
+      cursor: pointer; font-size: 11px; transition: background 0.1s;
+    }
+    .${SCRIPT_ID}-scroll-item:hover { background: rgba(255,255,255,0.05); }
+    .${SCRIPT_ID}-scroll-rank { font-weight: 700; color: #3aff9d; min-width: 20px; }
+    .${SCRIPT_ID}-scroll-info { color: #aaa; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .${SCRIPT_ID}-scroll-count { font-weight: 700; color: #3aff9d; }
+
+    article.message.${SCRIPT_ID}-hidden { display: none !important; }
+
+    .${SCRIPT_ID}-forum-bar {
+      display: flex; gap: 6px; align-items: center; padding: 8px 12px; flex-wrap: wrap;
+      background: rgba(18, 18, 18, 0.95); border: 1px solid #2b2b2b; border-radius: 10px; margin-bottom: 12px;
+    }
+    .${SCRIPT_ID}-forum-bar-label { font-size: 11px; font-weight: 700; color: #3aff9d; white-space: nowrap; }
+  `);
+
+  // ========================================
+  // UTILITIES
+  // ========================================
+  function log(...args) { console.log(LOG_PREFIX, ...args); }
+  function isThreadPage() { return !!document.querySelector('article.message, .message[data-content]'); }
+  function isForumListPage() { return !!document.querySelector('.structItem--thread') && !isThreadPage(); }
+
+  function getDateCutoff(rangeKey) {
+    const range = DATE_RANGES[rangeKey];
+    if (!range || range.days === 0) return null;
+    const cutoff = new Date();
+    cutoff.setDate(cutoff.getDate() - range.days);
+    cutoff.setHours(0, 0, 0, 0);
+    return cutoff;
+  }
+
+  // ========================================
+  // REACTION COUNT EXTRACTION
+  // ========================================
+  function getReactionCount(postEl) {
+    const reactionsBar = postEl.querySelector('.reactionsBar');
+    if (reactionsBar) {
+      const link = reactionsBar.querySelector('.reactionsBar-link');
+      if (link) {
+        const match = link.textContent.match(/(\d+)/);
+        if (match) return parseInt(match[1], 10);
+      }
+      const icons = reactionsBar.querySelectorAll('.reaction--small, .reaction, [data-reaction-id]');
+      if (icons.length > 0) {
+        let total = 0;
+        icons.forEach(icon => {
+          const countEl = icon.querySelector('.reaction-count, .u-srOnly');
+          const m = countEl ? countEl.textContent.match(/(\d+)/) : null;
+          total += m ? parseInt(m[1], 10) : 1;
+        });
+        return total;
+      }
+    }
+
+    const likesList = postEl.querySelector('.message-likes, .js-reactionsList, .likesBar');
+    if (likesList) {
+      const text = likesList.textContent.trim();
+      const m1 = text.match(/and\s+(\d+)\s+other/i);
+      if (m1) return parseInt(m1[1], 10) + 1;
+      const m2 = text.match(/(\d+)\s*(reaction|like|people)/i);
+      if (m2) return parseInt(m2[1], 10);
+      if (text.length > 0 && text.match(/[a-zA-Z]/)) {
+        const names = text.split(',').length;
+        if (names >= 1) return names;
+      }
+    }
+
+    const dataEl = postEl.querySelector('[data-reaction-count]');
+    if (dataEl) return parseInt(dataEl.dataset.reactionCount, 10) || 0;
+
+    return 0;
+  }
+
+  // ========================================
+  // POST DATA EXTRACTION
+  // ========================================
+  function getPostData(postEl) {
+    const reactions = getReactionCount(postEl);
+    let postDate = null;
+    const timeEl = postEl.querySelector('time[datetime], .message-attribution time, .message-date time, header time');
+    if (timeEl) {
+      const dt = timeEl.getAttribute('datetime');
+      if (dt) postDate = new Date(dt);
+    }
+    const postId = postEl.id || postEl.dataset.content || '';
+    const author = (postEl.querySelector('.message-name, .username') || {}).textContent?.trim() || '';
+    return { el: postEl, reactions, postDate, postId, author };
+  }
+
+  // ========================================
+  // THREAD VIEW: RANK + HIGHLIGHT
+  // ========================================
+  function getAllPosts() {
+    return Array.from(document.querySelectorAll('article.message, .message[data-content]'));
+  }
+
+  function applyFilters() {
+    if (!isThreadPage()) return;
+    const posts = getAllPosts();
+    const cutoff = getDateCutoff(currentDateRange);
+    const allData = posts.map(getPostData);
+
+    let visible = [];
+    let hiddenCount = 0;
+    allData.forEach(pd => {
+      if (cutoff && pd.postDate && pd.postDate < cutoff) {
+        pd.el.classList.add(`${SCRIPT_ID}-hidden`);
+        hiddenCount++;
+      } else {
+        pd.el.classList.remove(`${SCRIPT_ID}-hidden`);
+        visible.push(pd);
+      }
+    });
+
+    const sorted = [...visible];
+    if (currentSort === 'reactions') sorted.sort((a, b) => b.reactions - a.reactions);
+    else if (currentSort === 'newest') sorted.sort((a, b) => (b.postDate || 0) - (a.postDate || 0));
+    else if (currentSort === 'oldest') sorted.sort((a, b) => (a.postDate || 0) - (b.postDate || 0));
+
+    allData.forEach(pd => pd.el.querySelectorAll(`.${SCRIPT_ID}-rank-badge`).forEach(b => b.remove()));
+
+    sorted.forEach((pd, rank) => {
+      const badge = document.createElement('span');
+      const isTop3 = rank < 3 && pd.reactions > 0;
+      badge.className = `${SCRIPT_ID}-rank-badge${isTop3 ? ' top3' : (pd.reactions === 0 ? ' zero' : '')}`;
+      badge.textContent = `#${rank + 1} · ❤️ ${pd.reactions}`;
+      const header = pd.el.querySelector('.message-attribution, .message-userDetails, .message-cell--user, header');
+      if (header) header.appendChild(badge);
+    });
+
+    buildScrollList(sorted);
+    isActive = true;
+    updateStats(visible.length, hiddenCount, allData.length);
+    log(`Applied: sort=${currentSort}, range=${currentDateRange}, showing=${visible.length}/${allData.length}`);
+  }
+
+  function resetFilters() {
+    if (!isThreadPage()) return;
+    getAllPosts().forEach(p => {
+      p.classList.remove(`${SCRIPT_ID}-hidden`);
+      p.querySelectorAll(`.${SCRIPT_ID}-rank-badge`).forEach(b => b.remove());
+    });
+    isActive = false;
+    currentDateRange = 'all';
+    currentSort = 'reactions';
+    GM_setValue(`${SCRIPT_ID}_dateRange`, currentDateRange);
+    GM_setValue(`${SCRIPT_ID}_sort`, currentSort);
+    updatePanelState();
+    updateStats(0, 0, 0, true);
+    clearScrollList();
+    log('Filters reset');
+  }
+
+  function buildScrollList(sorted) {
+    const container = document.getElementById(`${SCRIPT_ID}-scroll-list`);
+    if (!container) return;
+    container.innerHTML = '';
+    sorted.slice(0, 20).forEach((pd, rank) => {
+      const item = document.createElement('div');
+      item.className = `${SCRIPT_ID}-scroll-item`;
+      const rankEl = document.createElement('span');
+      rankEl.className = `${SCRIPT_ID}-scroll-rank`;
+      rankEl.textContent = `#${rank + 1}`;
+      const info = document.createElement('span');
+      info.className = `${SCRIPT_ID}-scroll-info`;
+      info.textContent = pd.author || 'Anonymous';
+      const count = document.createElement('span');
+      count.className = `${SCRIPT_ID}-scroll-count`;
+      count.textContent = `❤️ ${pd.reactions}`;
+      item.appendChild(rankEl);
+      item.appendChild(info);
+      item.appendChild(count);
+      item.onclick = () => {
+        pd.el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        pd.el.style.outline = '2px solid #3aff9d';
+        setTimeout(() => { pd.el.style.outline = ''; }, 2000);
+      };
+      container.appendChild(item);
+    });
+  }
+
+  function clearScrollList() {
+    const c = document.getElementById(`${SCRIPT_ID}-scroll-list`);
+    if (c) c.innerHTML = '';
+  }
+
+  // ========================================
+  // FORUM LIST VIEW
+  // ========================================
+  function injectForumBar() {
+    if (!isForumListPage() || document.querySelector(`.${SCRIPT_ID}-forum-bar`)) return;
+    const listContainer = document.querySelector('.structItemContainer, .block-body');
+    if (!listContainer) return;
+
+    const bar = document.createElement('div');
+    bar.className = `${SCRIPT_ID}-forum-bar`;
+    const label = document.createElement('span');
+    label.className = `${SCRIPT_ID}-forum-bar-label`;
+    label.textContent = '🔥 Sort by Likes:';
+    bar.appendChild(label);
+
+    const baseUrl = window.location.pathname;
+    const currentParams = new URLSearchParams(window.location.search);
+    const isCurrentOrder = currentParams.get('order') === 'reaction_score';
+
+    Object.entries(DATE_RANGES).forEach(([key, range]) => {
+      const pill = document.createElement('span');
+      pill.className = `${SCRIPT_ID}-pill`;
+      pill.textContent = range.label;
+      if (key === 'all' && isCurrentOrder && !currentParams.has('last_days')) pill.classList.add('active');
+      else if (isCurrentOrder && currentParams.get('last_days') === String(range.days) && range.days > 0) pill.classList.add('active');
+      pill.addEventListener('click', () => {
+        const p = new URLSearchParams();
+        p.set('order', 'reaction_score');
+        if (range.days > 0) p.set('last_days', String(range.days));
+        window.location.href = baseUrl + '?' + p.toString();
+      });
+      bar.appendChild(pill);
+    });
+
+    const resetPill = document.createElement('span');
+    resetPill.className = `${SCRIPT_ID}-pill`;
+    resetPill.textContent = '↩ Default';
+    resetPill.style.color = '#888';
+    if (!isCurrentOrder) resetPill.classList.add('active');
+    resetPill.addEventListener('click', () => { window.location.href = baseUrl; });
+    bar.appendChild(resetPill);
+
+    listContainer.parentElement.insertBefore(bar, listContainer);
+  }
+
+  // ========================================
+  // UI: FLOATING PANEL
+  // ========================================
+  function createPanel() {
+    if (panelEl || !isThreadPage()) return;
+    const panel = document.createElement('div');
+    panel.className = `${SCRIPT_ID}-panel`;
+    if (GM_getValue(`${SCRIPT_ID}_minimized`, false)) panel.classList.add('minimized');
+
+    // Restore saved position from drag
+    const savedPos = GM_getValue(`${SCRIPT_ID}_panelPos`, null);
+    if (savedPos) {
+      if (savedPos.right) panel.style.right = savedPos.right;
+      if (savedPos.bottom) panel.style.bottom = savedPos.bottom;
+    }
+
+    const header = document.createElement('div');
+    header.className = `${SCRIPT_ID}-header`;
+    const title = document.createElement('div');
+    title.className = `${SCRIPT_ID}-title`;
+    title.textContent = '🔥 Post Filter';
+    const minimizeBtn = document.createElement('button');
+    minimizeBtn.className = `${SCRIPT_ID}-header-btn`;
+    minimizeBtn.title = 'Minimize (Alt+F)';
+    minimizeBtn.textContent = '−';
+    minimizeBtn.onclick = () => { const min = panel.classList.toggle('minimized'); GM_setValue(`${SCRIPT_ID}_minimized`, min); };
+    header.appendChild(title);
+    header.appendChild(minimizeBtn);
+    panel.appendChild(header);
+
+    const body = document.createElement('div');
+    body.className = `${SCRIPT_ID}-body`;
+
+    // Date Range
+    const dateLabel = document.createElement('div');
+    dateLabel.className = `${SCRIPT_ID}-section-label`;
+    dateLabel.textContent = 'Date Range';
+    body.appendChild(dateLabel);
+    const datePills = document.createElement('div');
+    datePills.className = `${SCRIPT_ID}-pills`;
+    datePills.id = `${SCRIPT_ID}-date-pills`;
+    Object.entries(DATE_RANGES).forEach(([key, range]) => {
+      const pill = document.createElement('span');
+      pill.className = `${SCRIPT_ID}-pill${key === currentDateRange ? ' active' : ''}`;
+      pill.dataset.range = key;
+      pill.textContent = range.label;
+      pill.addEventListener('click', () => {
+        currentDateRange = key;
+        GM_setValue(`${SCRIPT_ID}_dateRange`, key);
+        datePills.querySelectorAll(`.${SCRIPT_ID}-pill`).forEach(p => p.classList.remove('active'));
+        pill.classList.add('active');
+      });
+      datePills.appendChild(pill);
+    });
+    body.appendChild(datePills);
+
+    // Sort
+    const sortLabel = document.createElement('div');
+    sortLabel.className = `${SCRIPT_ID}-section-label`;
+    sortLabel.textContent = 'Sort By';
+    sortLabel.style.marginTop = '4px';
+    body.appendChild(sortLabel);
+    const sortRow = document.createElement('div');
+    sortRow.className = `${SCRIPT_ID}-sort-row`;
+    sortRow.id = `${SCRIPT_ID}-sort-row`;
+    Object.entries(SORT_MODES).forEach(([key, mode]) => {
+      const btn = document.createElement('div');
+      btn.className = `${SCRIPT_ID}-sort-btn${key === currentSort ? ' active' : ''}`;
+      btn.dataset.sort = key;
+      btn.textContent = mode.label;
+      btn.addEventListener('click', () => {
+        currentSort = key;
+        GM_setValue(`${SCRIPT_ID}_sort`, key);
+        sortRow.querySelectorAll(`.${SCRIPT_ID}-sort-btn`).forEach(b => b.classList.remove('active'));
+        btn.classList.add('active');
+      });
+      sortRow.appendChild(btn);
+    });
+    body.appendChild(sortRow);
+
+    // Actions
+    const actions = document.createElement('div');
+    actions.className = `${SCRIPT_ID}-actions`;
+    const applyBtn = document.createElement('button');
+    applyBtn.className = `${SCRIPT_ID}-apply-btn`;
+    applyBtn.textContent = 'Apply Filter';
+    applyBtn.onclick = applyFilters;
+    const resetBtn = document.createElement('button');
+    resetBtn.className = `${SCRIPT_ID}-reset-btn`;
+    resetBtn.textContent = 'Reset';
+    resetBtn.onclick = resetFilters;
+    actions.appendChild(applyBtn);
+    actions.appendChild(resetBtn);
+    body.appendChild(actions);
+
+    // Scroll list
+    const scrollList = document.createElement('div');
+    scrollList.className = `${SCRIPT_ID}-scroll-list`;
+    scrollList.id = `${SCRIPT_ID}-scroll-list`;
+    body.appendChild(scrollList);
+
+    // Stats
+    const stats = document.createElement('div');
+    stats.className = `${SCRIPT_ID}-stats`;
+    stats.id = `${SCRIPT_ID}-stats`;
+    stats.textContent = 'Select filters and click Apply';
+    body.appendChild(stats);
+
+    panel.appendChild(body);
+    document.body.appendChild(panel);
+    panelEl = panel;
+    makeDraggable(panel, header);
+  }
+
+  function updatePanelState() {
+    if (!panelEl) return;
+    const dp = panelEl.querySelector(`#${SCRIPT_ID}-date-pills`);
+    if (dp) dp.querySelectorAll(`.${SCRIPT_ID}-pill`).forEach(p => p.classList.toggle('active', p.dataset.range === currentDateRange));
+    const sr = panelEl.querySelector(`#${SCRIPT_ID}-sort-row`);
+    if (sr) sr.querySelectorAll(`.${SCRIPT_ID}-sort-btn`).forEach(b => b.classList.toggle('active', b.dataset.sort === currentSort));
+  }
+
+  function updateStats(showing, hidden, total, reset = false) {
+    const el = document.getElementById(`${SCRIPT_ID}-stats`);
+    if (!el) return;
+    el.textContent = reset ? 'Filters cleared' : `Showing ${showing} of ${total} posts${hidden > 0 ? ` (${hidden} hidden)` : ''}`;
+  }
+
+  // ========================================
+  // DRAGGABLE
+  // ========================================
+  function makeDraggable(panel, handle) {
+    let dragging = false, startX, startY, startRight, startBottom;
+    handle.addEventListener('mousedown', (e) => {
+      if (e.target.closest('button')) return;
+      dragging = true;
+      startX = e.clientX; startY = e.clientY;
+      startRight = parseInt(getComputedStyle(panel).right, 10) || 20;
+      startBottom = parseInt(getComputedStyle(panel).bottom, 10) || 20;
+      document.body.style.userSelect = 'none';
+      e.preventDefault();
+    });
+    document.addEventListener('mousemove', (e) => {
+      if (!dragging) return;
+      panel.style.right = Math.max(0, startRight + (startX - e.clientX)) + 'px';
+      panel.style.bottom = Math.max(0, startBottom + (startY - e.clientY)) + 'px';
+    });
+    document.addEventListener('mouseup', () => {
+      if (!dragging) return;
+      dragging = false;
+      document.body.style.userSelect = '';
+      GM_setValue(`${SCRIPT_ID}_panelPos`, { right: panel.style.right, bottom: panel.style.bottom });
+    });
+  }
+
+  // ========================================
+  // KEYBOARD
+  // ========================================
+  document.addEventListener('keydown', (e) => {
+    if (e.altKey && !e.shiftKey && e.key.toLowerCase() === 'f') {
+      e.preventDefault();
+      if (panelEl) { const min = panelEl.classList.toggle('minimized'); GM_setValue(`${SCRIPT_ID}_minimized`, min); }
+    }
+    if (e.altKey && e.shiftKey && e.key.toLowerCase() === 'f') {
+      e.preventDefault();
+      applyFilters();
+    }
+  });
+
+  // ========================================
+  // INIT
+  // ========================================
+  function init() {
+    if (isThreadPage()) { createPanel(); log('Thread view — panel injected'); }
+    if (isForumListPage()) { injectForumBar(); log('Forum list — filter bar injected'); }
+  }
+
+  init();
+  log('Initialized');
+
+})();
