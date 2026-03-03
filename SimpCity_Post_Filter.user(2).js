@@ -186,56 +186,61 @@
     //   .message-cell--main  → actual post content + per-post reactions
     const scopeEl = postEl.querySelector('.message-cell--main, .message-content, .message-body') || postEl;
 
-    // 1) Standard XenForo reactions bar (below post content)
+    // 1) Standard XenForo 2.x reactions bar (below post content)
     const reactionsBar = scopeEl.querySelector('.reactionsBar');
     if (reactionsBar) {
       const link = reactionsBar.querySelector('.reactionsBar-link');
       if (link) {
         const text = link.textContent.trim();
-        // Format: "UserA, UserB and 5 others" → count named users + N others
-        const othersMatch = text.match(/and\s+(\d[\d,]*)\s+other/i);
-        if (othersMatch) {
-          const othersCount = parseInt(othersMatch[1].replace(/,/g, ''), 10);
-          // Count named users before "and X others" (comma-separated <bdi> or text)
-          const beforeAnd = text.split(/\s+and\s+/i)[0];
-          const namedUsers = beforeAnd ? beforeAnd.split(',').filter(s => s.trim()).length : 0;
-          return namedUsers + othersCount;
+        if (!text) return 0;
+
+        // XenForo renders reactors as names in the link:
+        //   1 reactor:  "UserA"
+        //   2 reactors: "UserA and UserB"
+        //   3 reactors: "UserA, UserB, and UserC"  (Oxford comma)
+        //   4+ reactors: "UserA, UserB, UserC and 5 others"
+
+        // Parse "and X others" / "and X other people"
+        const othersMatch = text.match(/\band\s+(\d[\d,]*)\s+other/i);
+        const othersCount = othersMatch ? parseInt(othersMatch[1].replace(/,/g, ''), 10) : 0;
+
+        // Count named users: split on "and" to get names before it
+        const beforeAnd = text.split(/\band\b/i)[0];
+        const namedCount = beforeAnd.trim() ? beforeAnd.split(',').filter(s => s.trim()).length : 0;
+
+        if (othersCount > 0) {
+          // "User1, User2, User3 and 5 others" → 3 named + 5 others = 8
+          return namedCount + othersCount;
         }
-        // Format: "UserA and UserB" (no "others") → 2 people
-        if (text.match(/\s+and\s+/i) && !text.match(/other/i)) {
-          return 2;
+
+        // "and" present but no "others" → "UserA and UserB" or "UserA, UserB, and UserC"
+        if (/\band\b/i.test(text)) {
+          return namedCount + 1; // +1 for the name after "and"
         }
-        // Format: just "UserA" → 1 reaction
-        if (text.length > 0 && !text.match(/^\d/)) {
-          return 1;
-        }
-        // Format: plain number like "7 reactions"
+
+        // No "and" → single reactor "UserA", or comma-separated "UserA, UserB, UserC"
+        if (namedCount > 0) return namedCount;
+
+        // Bare number format: "7 reactions" (some themes)
         const numMatch = text.match(/^(\d[\d,]*)/);
         if (numMatch) return parseInt(numMatch[1].replace(/,/g, ''), 10);
       }
 
-      // Fallback: count individual reaction icons in the bar
-      const icons = reactionsBar.querySelectorAll('.reaction--small, [data-reaction-id]');
-      if (icons.length > 0) {
-        let total = 0;
-        icons.forEach(icon => {
-          const countEl = icon.querySelector('.reaction-count, .u-srOnly');
-          const m = countEl ? countEl.textContent.match(/(\d[\d,]*)/) : null;
-          total += m ? parseInt(m[1].replace(/,/g, ''), 10) : 1;
-        });
-        return total;
-      }
+      // Fallback: each .reaction--small icon = 1 reaction TYPE, not 1 reaction.
+      // This is a minimum estimate (at least 1 person per type).
+      const icons = reactionsBar.querySelectorAll('.reaction--small, .reaction[data-reaction-id]');
+      if (icons.length > 0) return icons.length;
     }
 
     // 2) Older XenForo likes bar — still scoped to main content area
     const likesList = scopeEl.querySelector('.message-likes, .likesBar');
     if (likesList) {
       const text = likesList.textContent.trim();
-      const m1 = text.match(/and\s+(\d[\d,]*)\s+other/i);
+      const m1 = text.match(/\band\s+(\d[\d,]*)\s+other/i);
       if (m1) {
         const others = parseInt(m1[1].replace(/,/g, ''), 10);
-        const beforeAnd = text.split(/\s+and\s+/i)[0];
-        const named = beforeAnd ? beforeAnd.split(',').filter(s => s.trim()).length : 0;
+        const beforeAnd = text.split(/\band\b/i)[0];
+        const named = beforeAnd.trim() ? beforeAnd.split(',').filter(s => s.trim()).length : 0;
         return named + others;
       }
       const m2 = text.match(/(\d[\d,]*)\s*(reaction|like|people)/i);
